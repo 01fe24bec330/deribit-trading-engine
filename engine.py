@@ -73,9 +73,17 @@ def get_klines(symbol, interval):
 def check_signal(symbol):
 
     df_4h = get_klines(symbol, "4h")
-    df_1h = get_klines(symbol, "1h")
-    df_15m = get_klines(symbol, "15m")
+df_1h = get_klines(symbol, "1h")
+df_15m = get_klines(symbol, "15m")
 
+# ===== SAFETY CHECK =====
+if (
+    df_4h is None or df_1h is None or df_15m is None or
+    len(df_4h) < 210 or
+    len(df_1h) < 210 or
+    len(df_15m) < 50
+):
+    return None
     df_4h["ema200"] = ta.trend.ema_indicator(df_4h["close"], 200)
 
     df_1h["ema50"] = ta.trend.ema_indicator(df_1h["close"], 50)
@@ -231,3 +239,4 @@ while True:
     except Exception as e:
         print("Error:", e)
         time.sleep(10)
+
