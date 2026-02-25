@@ -1,63 +1,38 @@
 import requests
 import pandas as pd
-import numpy as np
 import ta
 import time
-import sqlite3
 from datetime import datetime, date
 
-# =============================
+# =========================
 # CONFIG
-# =============================
+# =========================
 
-import os
+SYMBOLS = {
+    "BTC": "BTCUSDT",
+    "ETH": "ETHUSDT",
+    "SOL": "SOLUSDT"
+}
 
-CLIENT_ID = os.getenv("CLIENT_ID")
-CLIENT_SECRET = os.getenv("CLIENT_SECRET")
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+START_CAPITAL = 100
+RISK_PERCENT = 0.01
+STOP_PERCENT = 0.006
+TP_PERCENT = 0.012
+MAX_TRADES_PER_DAY = 5
+ADX_THRESHOLD = 20
 
-BASE_URL = "https://test.deribit.com"
+TELEGRAM_TOKEN = "8688486536:AAGkjcujF9xRfB6w-UuiexM7iSg7Scs-GS0"
+TELEGRAM_CHAT_ID = "7225721600"
 
-SYMBOLS = ["BTC-PERPETUAL", "ETH-PERPETUAL"]
+capital = START_CAPITAL
+open_positions = {}
+trades_today = 0
+current_day = date.today()
+last_heartbeat = 0
 
-RISK_PERCENT = 0.003
-LEVERAGE = 5
-RR_RATIO = 2
-MAX_DAILY_LOSS_PERCENT = 0.02
-
-access_token = None
-tracked_positions = {}
-daily_start_equity = None
-daily_locked = False
-
-# =============================
-# DATABASE
-# =============================
-
-conn = sqlite3.connect("trades.db")
-cursor = conn.cursor()
-
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS trades (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    symbol TEXT,
-    side TEXT,
-    entry REAL,
-    stop REAL,
-    target REAL,
-    size REAL,
-    exit REAL,
-    pnl REAL,
-    entry_time TEXT,
-    exit_time TEXT
-)
-""")
-conn.commit()
-
-# =============================
+# =========================
 # TELEGRAM
-# =============================
+# =========================
 
 def send_telegram(msg):
     try:
@@ -68,311 +43,191 @@ def send_telegram(msg):
     except:
         pass
 
-# =============================
-# AUTH
-# =============================
+# =========================
+# DATA FUNCTIONS
+# =========================
 
-def authenticate():
-    global access_token
+def get_price(symbol):
+    url = f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}"
+    return float(requests.get(url).json()["price"])
 
-    r = requests.get(
-        f"{BASE_URL}/api/v2/public/auth",
-        params={
-            "grant_type": "client_credentials",
-            "client_id": CLIENT_ID,
-            "client_secret": CLIENT_SECRET
-        }
-    ).json()
+def get_klines(symbol, interval):
+    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit=200"
+    data = requests.get(url).json()
 
-    if "result" not in r:
-        print("AUTH FAILED:", r)
-        return False
+    df = pd.DataFrame(data, columns=[
+        "time","open","high","low","close",
+        "v1","v2","v3","v4","v5","v6","v7"
+    ])
 
-    access_token = r["result"]["access_token"]
-    print("Authenticated successfully")
-    return True
+    df["close"] = df["close"].astype(float)
+    df["high"] = df["high"].astype(float)
+    df["low"] = df["low"].astype(float)
 
+    return df
 
-def private(method, params=None):
-    global access_token
-
-    headers = {"Authorization": f"Bearer {access_token}"}
-
-    r = requests.get(
-        f"{BASE_URL}/api/v2/{method}",
-        params=params,
-        headers=headers
-    ).json()
-
-    if "error" in r:
-        authenticate()
-        headers = {"Authorization": f"Bearer {access_token}"}
-        r = requests.get(
-            f"{BASE_URL}/api/v2/{method}",
-            params=params,
-            headers=headers
-        ).json()
-
-    return r
-
-
-def public(method, params=None):
-    return requests.get(f"{BASE_URL}/api/v2/{method}", params=params).json()
-
-# =============================
-# ACCOUNT
-# =============================
-
-def get_equity(currency):
-    r = private("private/get_account_summary", {"currency": currency})
-    if "result" not in r:
-        return 0
-    return r["result"]["equity"]
-
-
-def get_positions(currency):
-    r = private("private/get_positions", {"currency": currency})
-    if "result" not in r:
-        return []
-    return r["result"]
-
-# =============================
-# DATA
-# =============================
-
-def get_klines(symbol, resolution):
-    end_ts = int(time.time() * 1000)
-    start_ts = end_ts - (int(resolution) * 200 * 60 * 1000)
-
-    r = public("public/get_tradingview_chart_data", {
-        "instrument_name": symbol,
-        "resolution": resolution,
-        "start_timestamp": start_ts,
-        "end_timestamp": end_ts
-    })
-
-    if "result" not in r:
-        return None
-
-    d = r["result"]
-
-    return pd.DataFrame({
-        "open": d["open"],
-        "high": d["high"],
-        "low": d["low"],
-        "close": d["close"],
-        "volume": d["volume"],
-        "timestamp": d["ticks"]
-    })
-
-# =============================
-# EXECUTION
-# =============================
-
-def place_orders(symbol, side, size, stop, target):
-
-    entry_method = "private/buy" if side == "buy" else "private/sell"
-    exit_method = "private/sell" if side == "buy" else "private/buy"
-
-    private(entry_method, {
-        "instrument_name": symbol,
-        "amount": round(size, 3),
-        "type": "market"
-    })
-
-    private(exit_method, {
-        "instrument_name": symbol,
-        "amount": round(size, 3),
-        "type": "stop_market",
-        "stop_price": stop
-    })
-
-    private(exit_method, {
-        "instrument_name": symbol,
-        "amount": round(size, 3),
-        "type": "take_profit_market",
-        "stop_price": target
-    })
-
-# =============================
-# POSITION MONITOR
-# =============================
-
-def monitor_positions():
-    for symbol in SYMBOLS:
-
-        currency = "BTC" if "BTC" in symbol else "ETH"
-        positions = get_positions(currency)
-
-        current_pos = next(
-            (p for p in positions if p["instrument_name"] == symbol and abs(p["size"]) > 0),
-            None
-        )
-
-        if symbol in tracked_positions and current_pos is None:
-
-            last_trade = private(
-                "private/get_user_trades_by_instrument",
-                {"instrument_name": symbol, "count": 1}
-            )
-
-            if "result" in last_trade and len(last_trade["result"]) > 0:
-                t = last_trade["result"][0]
-                exit_price = t["price"]
-                pnl = t["profit_loss"]
-
-                cursor.execute("""
-                UPDATE trades
-                SET exit=?, pnl=?, exit_time=?
-                WHERE id=(SELECT id FROM trades WHERE symbol=? ORDER BY id DESC LIMIT 1)
-                """, (
-                    exit_price,
-                    pnl,
-                    str(datetime.utcnow()),
-                    symbol
-                ))
-                conn.commit()
-
-                msg = f"""
-{symbol} CLOSED
-Exit: {round(exit_price,2)}
-PnL: {round(pnl,6)}
-"""
-                print(msg)
-                send_telegram(msg)
-
-            del tracked_positions[symbol]
-
-        if current_pos and symbol not in tracked_positions:
-            tracked_positions[symbol] = current_pos
-
-# =============================
+# =========================
 # STRATEGY
-# =============================
+# =========================
 
-def check_symbol(symbol):
+def check_signal(symbol):
 
-    if daily_locked:
-        return
+    df_4h = get_klines(symbol, "4h")
+    df_1h = get_klines(symbol, "1h")
+    df_15m = get_klines(symbol, "15m")
 
-    currency = "BTC" if "BTC" in symbol else "ETH"
+    df_4h["ema200"] = ta.trend.ema_indicator(df_4h["close"], 200)
 
-    positions = get_positions(currency)
-    if any(abs(p["size"]) > 0 and p["instrument_name"] == symbol for p in positions):
-        return
+    df_1h["ema50"] = ta.trend.ema_indicator(df_1h["close"], 50)
+    df_1h["ema200"] = ta.trend.ema_indicator(df_1h["close"], 200)
 
-    df_htf = get_klines(symbol, "360")
-    df_15 = get_klines(symbol, "15")
-
-    if df_htf is None or df_15 is None:
-        return
-
-    df_htf["ema100"] = ta.trend.ema_indicator(df_htf["close"], 100)
-    df_15["rsi"] = ta.momentum.rsi(df_15["close"], 14)
-    df_15["atr"] = ta.volatility.average_true_range(
-        df_15["high"], df_15["low"], df_15["close"], 14
+    df_15m["ema20"] = ta.trend.ema_indicator(df_15m["close"], 20)
+    df_15m["rsi"] = ta.momentum.rsi(df_15m["close"], 14)
+    df_15m["atr"] = ta.volatility.average_true_range(
+        df_15m["high"], df_15m["low"], df_15m["close"], 14
+    )
+    df_15m["adx"] = ta.trend.adx(
+        df_15m["high"], df_15m["low"], df_15m["close"], 14
     )
 
-    bias_long = df_htf.iloc[-1]["close"] > df_htf.iloc[-1]["ema100"]
+    last_4h = df_4h.iloc[-1]
+    last_1h = df_1h.iloc[-1]
+    last_15m = df_15m.iloc[-1]
 
-    row = df_15.iloc[-1]
-    prev = df_15.iloc[-2]
-    atr = row["atr"]
+    bias_long = last_4h["close"] > last_4h["ema200"]
+    trend_long = last_1h["ema50"] > last_1h["ema200"]
 
-    equity = get_equity(currency)
-    if equity == 0:
-        return
+    atr_avg = df_15m["atr"].rolling(20).mean().iloc[-1]
+    volatility_ok = last_15m["atr"] > atr_avg
+    strength_ok = last_15m["adx"] > ADX_THRESHOLD
 
-    risk_amount = equity * RISK_PERCENT
-    stop_distance = atr * 1.5
-    size = (risk_amount * LEVERAGE) / stop_distance
+    near_ema = abs(last_15m["close"] - last_15m["ema20"]) / last_15m["close"] < 0.002
 
-    if bias_long and row["rsi"] < 40 and row["close"] > prev["high"]:
+    # LONG
+    if bias_long and trend_long and volatility_ok and strength_ok:
+        if near_ema and 40 <= last_15m["rsi"] <= 55:
+            return "LONG", last_15m["close"]
 
-        entry = row["close"]
-        stop = entry - stop_distance
-        target = entry + stop_distance * RR_RATIO
+    # SHORT
+    if not bias_long and not trend_long and volatility_ok and strength_ok:
+        if near_ema and 45 <= last_15m["rsi"] <= 60:
+            return "SHORT", last_15m["close"]
 
-        place_orders(symbol, "buy", size, stop, target)
+    return None
 
-        cursor.execute("""
-        INSERT INTO trades (symbol, side, entry, stop, target, size, entry_time)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (
-            symbol,
-            "buy",
-            entry,
-            stop,
-            target,
-            size,
-            str(datetime.utcnow())
-        ))
-        conn.commit()
+# =========================
+# TRADE MANAGEMENT
+# =========================
+
+def open_trade(symbol, direction, entry):
+    global capital, trades_today
+
+    risk_amount = capital * RISK_PERCENT
+
+    if direction == "LONG":
+        stop = entry * (1 - STOP_PERCENT)
+        target = entry * (1 + TP_PERCENT)
+    else:
+        stop = entry * (1 + STOP_PERCENT)
+        target = entry * (1 - TP_PERCENT)
+
+    open_positions[symbol] = {
+        "direction": direction,
+        "entry": entry,
+        "stop": stop,
+        "target": target,
+        "risk": risk_amount
+    }
+
+    trades_today += 1
+
+    send_telegram(f"""
+📥 {symbol} {direction}
+Entry: {round(entry,4)}
+Stop: {round(stop,4)}
+Target: {round(target,4)}
+Capital: {round(capital,2)} USDT
+""")
+
+def check_exit(symbol):
+    global capital
+
+    pos = open_positions[symbol]
+    price = get_price(SYMBOLS[symbol])
+
+    if pos["direction"] == "LONG":
+        if price <= pos["stop"]:
+            pnl = -pos["risk"]
+        elif price >= pos["target"]:
+            pnl = pos["risk"] * 2
+        else:
+            return
+    else:
+        if price >= pos["stop"]:
+            pnl = -pos["risk"]
+        elif price <= pos["target"]:
+            pnl = pos["risk"] * 2
+        else:
+            return
+
+    capital += pnl
+
+    send_telegram(f"""
+❌ {symbol} CLOSED
+PnL: {round(pnl,2)} USDT
+New Capital: {round(capital,2)} USDT
+""")
+
+    del open_positions[symbol]
+
+# =========================
+# HEARTBEAT (1 HOUR)
+# =========================
+
+def heartbeat():
+    global last_heartbeat
+
+    if time.time() - last_heartbeat >= 3600:
 
         msg = f"""
-{symbol} LONG ENTERED
-Entry: {round(entry,2)}
-Stop: {round(stop,2)}
-Target: {round(target,2)}
-Size: {round(size,3)}
-Leverage: {LEVERAGE}x
+🤖 ENGINE ALIVE (1H)
+Time: {datetime.utcnow().strftime('%H:%M:%S')} UTC
+Capital: {round(capital,2)} USDT
+Open Positions: {len(open_positions)}
+Trades Today: {trades_today}
 """
+
         print(msg)
         send_telegram(msg)
 
-    elif not bias_long and row["rsi"] > 60 and row["close"] < prev["low"]:
+        last_heartbeat = time.time()
 
-        entry = row["close"]
-        stop = entry + stop_distance
-        target = entry - stop_distance * RR_RATIO
+# =========================
+# MAIN LOOP
+# =========================
 
-        place_orders(symbol, "sell", size, stop, target)
-
-        cursor.execute("""
-        INSERT INTO trades (symbol, side, entry, stop, target, size, entry_time)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (
-            symbol,
-            "sell",
-            entry,
-            stop,
-            target,
-            size,
-            str(datetime.utcnow())
-        ))
-        conn.commit()
-
-        msg = f"""
-{symbol} SHORT ENTERED
-Entry: {round(entry,2)}
-Stop: {round(stop,2)}
-Target: {round(target,2)}
-Size: {round(size,3)}
-Leverage: {LEVERAGE}x
-"""
-        print(msg)
-        send_telegram(msg)
-
-# =============================
-# MAIN
-# =============================
-
-print("FINAL INSTITUTIONAL ENGINE RUNNING...")
-
-if not authenticate():
-    exit()
-
-daily_start_equity = get_equity("BTC")
+send_telegram("🚀 Advanced Virtual Engine Online")
 
 while True:
     try:
-        for s in SYMBOLS:
-            check_symbol(s)
+        if date.today() != current_day:
+            trades_today = 0
 
-        monitor_positions()
+        heartbeat()
 
-        time.sleep(20)
+        for coin in SYMBOLS.keys():
+
+            if coin in open_positions:
+                check_exit(coin)
+            else:
+                if trades_today < MAX_TRADES_PER_DAY:
+                    signal = check_signal(SYMBOLS[coin])
+                    if signal:
+                        direction, entry = signal
+                        open_trade(coin, direction, entry)
+
+        time.sleep(60)
 
     except Exception as e:
-        print("Runtime error:", e)
+        print("Error:", e)
         time.sleep(10)
